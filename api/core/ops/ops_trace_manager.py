@@ -1593,6 +1593,14 @@ class TraceQueueManager:
                 file_id = uuid4().hex
                 trace_info = task.execute()
 
+                if not hasattr(trace_info, "model_dump"):
+                    logger.warning(
+                        "Skipping trace without Pydantic model for app_id=%s trace_type=%s",
+                        storage_id,
+                        task.trace_type,
+                    )
+                    continue
+
                 task_data = TaskData(
                     app_id=storage_id,
                     trace_info_type=type(trace_info).__name__,
