@@ -55,17 +55,61 @@ def process_trace_tasks(self, file_info):
     file_id = file_info.get("file_id")
     file_path = f"{OPS_FILE_PATH}{app_id}/{file_id}.json"
     file_data = json.loads(storage.load(file_path))
-    trace_info = file_data.get("trace_info")
+    raw_trace_info = file_data.get("trace_info")
     trace_info_type = file_data.get("trace_info_type")
     enterprise_trace_dispatched = bool(file_data.get("_enterprise_trace_dispatched"))
     trace_instance = OpsTraceManager.get_ops_trace_instance(app_id)
 
+    # Defensive: trace_info must be a dict. If it is missing or malformed, clean up and exit.
+    if not isinstance(raw_trace_info, dict):
+        logger.warning("Malformed trace payload for app_id=%s file_id=%s: trace_info is %s", app_id, file_id, type(raw_trace_info).__name__)
+        try:
+            storage.delete(file_path)
+        except Exception:
+            pass
+        return
+
+    # Copy trace_info so reconstruction mutations do not leak back into file_data
+    # (retry saves must not attempt to JSON-serialize SQLAlchemy model instances).
+    trace_info = dict(raw_trace_info)
+
+    def _ensure_dict(value):
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                return json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return {}
+
+    def _ensure_list(value):
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                return list(parsed) if isinstance(parsed, (list, tuple)) else []
+            except (json.JSONDecodeError, TypeError):
+                return []
+        return []
+
     if trace_info.get("message_data"):
-        trace_info["message_data"] = Message.from_dict(data=trace_info["message_data"])
+        trace_info["message_data"] = Message.from_dict(data=_ensure_dict(trace_info["message_data"]))
     if trace_info.get("workflow_data"):
-        trace_info["workflow_data"] = WorkflowRun.from_dict(data=trace_info["workflow_data"])
+        trace_info["workflow_data"] = WorkflowRun.from_dict(data=_ensure_dict(trace_info["workflow_data"]))
     if trace_info.get("documents"):
-        trace_info["documents"] = [Document.model_validate(doc) for doc in trace_info["documents"]]
+        trace_info["documents"] = [Document.model_validate(doc) for doc in _ensure_list(trace_info["documents"])]
+
+    # Sanitize message_file_data: SQLAlchemy instances cannot survive JSON round-trips.
+    # Trace builders do not read this field, so dropping it is safe.
+    if not isinstance(trace_info.get("message_file_data"), (dict, list, str, int, float, bool, type(None))):
+        trace_info["message_file_data"] = None
+
+    # Workflow node execution fields may arrive as JSON strings in some paths.
+    for mapping_field in ("node_inputs", "node_outputs", "process_data"):
+        if mapping_field in trace_info:
+            trace_info[mapping_field] = _ensure_dict(trace_info[mapping_field])
 
     should_delete_file = True
 
@@ -115,7 +159,7 @@ def process_trace_tasks(self, file_info):
             )
             try:
                 if enterprise_trace_dispatched:
-                    storage.save(file_path, json.dumps(file_data).encode("utf-8"))
+                    storage.save(file_path, json.dumps(file_data, default=str).encode("utf-8"))
                 raise self.retry(exc=e, countdown=_RETRYABLE_TRACE_DISPATCH_DELAY_SECONDS)
             except Retry:
                 should_delete_file = False

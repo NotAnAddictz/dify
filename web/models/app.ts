@@ -6,6 +6,7 @@ import type {
   LangSmithConfig,
   MLflowConfig,
   OpikConfig,
+  OTelConfig,
   PhoenixConfig,
   TencentConfig,
   TracingProvider,
@@ -81,7 +82,6 @@ export type AppDailyEndUsersResponse = {
 export type AppTokenCostsResponse = {
   data: Array<{ date: string; token_count: number; total_price: number; currency: number }>
 }
-
 export type UpdateAppModelConfigResponse = { result: string }
 
 type ApiKeyItemResponse = {
@@ -142,6 +142,7 @@ export type TracingConfig = {
     | WeaveConfig
     | AliyunConfig
     | TencentConfig
+    | OTelConfig
 }
 
 export type WebhookTriggerResponse = {

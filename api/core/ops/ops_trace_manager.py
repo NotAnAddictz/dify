@@ -16,7 +16,7 @@ from pydantic import TypeAdapter
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from core.helper.encrypter import batch_decrypt_token, encrypt_token, obfuscated_token
+from core.helper.encrypter import batch_decrypt_token, encrypt_token, is_obfuscated_token, obfuscated_token
 from core.helper.trace_id_helper import ParentTraceContext
 from core.ops.entities.config_entity import (
     OPS_FILE_PATH,
@@ -36,6 +36,11 @@ from core.ops.entities.trace_entity import (
     TraceTaskName,
     WorkflowNodeTraceInfo,
     WorkflowTraceInfo,
+)
+from core.ops.unified_trace.registry import (
+    UnifiedProviderConfigEntry,
+    unified_dispatch_enabled,
+    unified_provider_config_map,
 )
 from core.ops.utils import JSON_DICT_ADAPTER, get_message_data
 from extensions.ext_database import db
@@ -330,6 +335,16 @@ class OpsTraceProviderConfigMap(collections.UserDict[str, TracingProviderConfigE
                         "trace_instance": TencentDataTrace,
                     }
 
+                case TracingProviderEnum.OTEL:
+                    from core.ops.unified_trace.otel import OTelTracingConfig, UnifiedOTelTrace
+
+                    return {
+                        "config_class": OTelTracingConfig,
+                        "secret_keys": ["headers"],
+                        "other_keys": ["endpoint", "service_name", "resource_attributes", "project_url"],
+                        "trace_instance": UnifiedOTelTrace,
+                    }
+
                 case _:
                     raise KeyError(f"Unsupported tracing provider: {key}")
         except ImportError:
@@ -343,6 +358,22 @@ class OpsTraceManager:
     ops_trace_instances_cache: LRUCache = LRUCache(maxsize=128)
     decrypted_configs_cache: LRUCache = LRUCache(maxsize=128)
     _decryption_cache_lock = threading.RLock()
+
+    @classmethod
+    def _get_dispatch_entry(
+        cls, tracing_provider: str
+    ) -> tuple[str, TracingProviderConfigEntry | UnifiedProviderConfigEntry]:
+        """Select one tracing mode before constructing an instance.
+
+        Registered unified providers never fall back after construction or dispatch starts.
+        Unregistered providers continue through the legacy registry.
+        """
+        if unified_dispatch_enabled(tracing_provider):
+            try:
+                return "unified", unified_provider_config_map[tracing_provider]
+            except KeyError:
+                pass
+        return "legacy", provider_config_map[tracing_provider]
 
     @classmethod
     def encrypt_tracing_config(
@@ -367,15 +398,17 @@ class OpsTraceManager:
         # Encrypt necessary keys
         for key in secret_keys:
             if key in tracing_config:
-                if "*" in tracing_config[key]:
-                    # If the key contains '*', retain the original value from the current config
-                    if current_trace_config:
-                        new_config[key] = current_trace_config.get(key, tracing_config[key])
-                    else:
-                        new_config[key] = tracing_config[key]
+                value = tracing_config[key]
+                if not isinstance(value, str):
+                    # Structured secrets (e.g. OTel headers dict) are serialized before encryption
+                    value = json.dumps(value, default=str, ensure_ascii=False)
+                stored_value = current_trace_config.get(key) if current_trace_config else None
+                if is_obfuscated_token(value) and stored_value:
+                    # The console echoes unchanged secrets back masked; keep the stored ciphertext
+                    new_config[key] = stored_value
                 else:
-                    # Otherwise, encrypt the key
-                    new_config[key] = encrypt_token(tenant_id, tracing_config[key])
+                    # Never persist a secret in plaintext, even a masked placeholder without a stored value
+                    new_config[key] = encrypt_token(tenant_id, value)
 
         for key in other_keys:
             new_config[key] = tracing_config.get(key, "")
@@ -445,7 +478,13 @@ class OpsTraceManager:
         new_config: dict[str, Any] = {}
         for key in secret_keys:
             if key in decrypt_tracing_config:
-                new_config[key] = obfuscated_token(decrypt_tracing_config[key])
+                value = decrypt_tracing_config[key]
+                # Echo back an empty secret as-is so the console can distinguish "not configured"
+                # from a stored credential; only real secrets are masked.
+                if isinstance(value, str) and config_class.is_blank_secret(key, value):
+                    new_config[key] = value
+                else:
+                    new_config[key] = obfuscated_token(value)
 
         for key in other_keys:
             new_config[key] = decrypt_tracing_config.get(key, "")
@@ -1192,7 +1231,7 @@ class TraceTask:
         tool_parameters = {}
         created_time = message_data.created_at
         end_time = message_data.updated_at
-        agent_thoughts = message_data.agent_thoughts
+        agent_thoughts = message_data.agent_thoughts_with_session(session=db.session())
         for agent_thought in agent_thoughts:
             if tool_name in agent_thought.tools:
                 created_time = agent_thought.created_at
